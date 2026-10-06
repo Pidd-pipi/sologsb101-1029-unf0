@@ -1,74 +1,51 @@
 /**
- * 连戏差异 store：维护差异列表、严重程度筛选与解决状态流转。
+ * 连戏差异 store：维护差异列表、严重程度/状态筛选与解决状态流转。
+ * 重新比对走 recompute：旧差异恢复或归档（痕迹保留在历史与共同账 resolutions）。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
-import type { Conflict } from '@/types/conflict'
 import type { FilterModel } from '@/types/filter'
-import type { ConflictRow } from '@/utils/db'
-import { putConflict, removeConflict, reopenConflict, resolveConflict, saveConflicts, ROW_REVISION } from '@/utils/db'
-import { createId } from '@/utils/uuid'
+import { recomputeConflicts, resolveConflict, reopenConflict, type RecomputeStats } from '@/utils/db'
 import { queryToFilters } from '@/utils/query'
 import type { DiffCandidate } from '@/hooks/useContinuityDiff'
 
-export const CONFLICT_FILTER_KEYS = ['severities', 'states']
+export const CONFLICT_FILTER_KEYS = ['severities', 'states', 'staleness']
 
 export const useConflictStore = defineStore('conflict', () => {
-  const filters = ref<FilterModel>({ keyword: '', severities: [], states: [] })
-  const lastGenerated = ref<number>(0)
+  const filters = ref<FilterModel>({ keyword: '', severities: [], states: [], staleness: [] })
+  /** 最近一次重算结果（生成/恢复/归档数） */
+  const lastRecompute = ref<RecomputeStats>({ created: 0, restored: 0, archived: 0 })
 
   function setFilters(next: FilterModel): void {
     filters.value = next
   }
 
   function resetFilters(): void {
-    filters.value = { keyword: '', severities: [], states: [] }
+    filters.value = { keyword: '', severities: [], states: [], staleness: [] }
   }
 
   function applyQuery(query: LocationQuery): void {
     filters.value = queryToFilters(query, CONFLICT_FILTER_KEYS)
   }
 
-  /** 由比对候选生成差异条目（已存在的同一对记录不会重复生成） */
-  async function generate(candidates: DiffCandidate[]): Promise<number> {
-    const now = Date.now()
-    const rows: ConflictRow[] = candidates.map((item) => ({
-      id: createId('conflict'),
-      elementId: item.elementId,
-      recordIdA: item.a.id,
-      recordIdB: item.b.id,
-      diffDesc: item.desc,
-      severity: item.severity,
-      state: '待确认',
-      resolvedNote: '',
-      resolvedAt: '',
-      revision: ROW_REVISION,
-      createdAt: now,
-      updatedAt: now
-    }))
-    const created = await saveConflicts(rows)
-    lastGenerated.value = created
-    return created
+  /** 由比对候选重新生成/恢复/归档差异（只认当前账面） */
+  async function regenerate(candidates: DiffCandidate[], ledgerId?: string): Promise<RecomputeStats> {
+    const stats = await recomputeConflicts(
+      candidates.map((item) => ({
+        ledgerId: item.ledgerId,
+        recordIdA: item.a.id,
+        recordIdB: item.b.id,
+        diffDesc: item.desc,
+        severity: item.severity
+      })),
+      ledgerId
+    )
+    lastRecompute.value = stats
+    return stats
   }
 
-  /** 手工登记一条差异（用于现场口头发现的偏差） */
-  async function createManual(payload: Omit<Conflict, 'id' | 'resolvedNote' | 'resolvedAt'>): Promise<string> {
-    const now = Date.now()
-    const id = createId('conflict')
-    await putConflict({
-      ...payload,
-      id,
-      resolvedNote: '',
-      resolvedAt: '',
-      revision: ROW_REVISION,
-      createdAt: now,
-      updatedAt: now
-    })
-    return id
-  }
-
-  /** 解决差异：写入留痕并回写要素初始状态 */
+  /** 解决差异：写入留痕并回写当前基准；待重算差异禁止处置 */
   async function resolve(id: string, note: string): Promise<void> {
     await resolveConflict(id, note)
   }
@@ -77,9 +54,5 @@ export const useConflictStore = defineStore('conflict', () => {
     await reopenConflict(id)
   }
 
-  async function remove(id: string): Promise<void> {
-    await removeConflict(id)
-  }
-
-  return { filters, lastGenerated, setFilters, resetFilters, applyQuery, generate, createManual, resolve, reopen, remove }
+  return { filters, lastRecompute, setFilters, resetFilters, applyQuery, regenerate, resolve, reopen }
 })

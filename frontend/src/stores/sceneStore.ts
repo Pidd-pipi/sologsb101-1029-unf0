@@ -1,12 +1,13 @@
 /**
  * 场次 store：维护场次列表、拍摄顺序与筛选条件。
+ * 撤场走共同账级联（摘挂编号、作废记录、差异待重算）。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
 import type { Scene } from '@/types/scene'
 import type { FilterModel } from '@/types/filter'
-import { nextShootOrder, putScene, removeScene, reorderScenes, updateScene as updateSceneRow, ROW_REVISION } from '@/utils/db'
+import { nextShootOrder, saveScene, removeScene, reorderScenes, updateSceneRow, ROW_REVISION } from '@/utils/db'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
@@ -33,10 +34,10 @@ export const useSceneStore = defineStore('scene', () => {
   }
 
   async function createScene(payload: Omit<Scene, 'id' | 'shootOrder'>): Promise<string> {
-    const now = Date.now()
     const id = createId('scene')
     const shootOrder = await nextShootOrder()
-    await putScene({ ...payload, id, shootOrder, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+    const now = Date.now()
+    await saveScene({ ...payload, id, shootOrder, revision: ROW_REVISION, createdAt: now, updatedAt: now })
     selectedSceneId.value = id
     return id
   }
@@ -45,6 +46,7 @@ export const useSceneStore = defineStore('scene', () => {
     await updateSceneRow(id, patch)
   }
 
+  /** 撤场：共同账摘挂、现场记录作废保留、差异转待重算 */
   async function deleteScene(id: string): Promise<void> {
     await removeScene(id)
     if (selectedSceneId.value === id) selectedSceneId.value = null
