@@ -24,12 +24,14 @@ const filters = ref<FilterModel>({ keyword: '' })
 const preview = ref('')
 
 const totals = computed(() => {
-  const open = conflicts.value.filter((item) => item.state === '待确认')
+  const current = conflicts.value.filter((item) => item.stale === '现行')
+  const open = current.filter((item) => item.state === '待确认')
   return {
     total: conflicts.value.length,
     open: open.length,
     resolved: conflicts.value.filter((item) => item.state === '已解决').length,
     blocking: open.filter((item) => item.severity === '阻断').length,
+    stale: conflicts.value.filter((item) => item.stale === '待重算').length,
     risk: riskScore(open)
   }
 })
@@ -121,11 +123,11 @@ watch(filters, (value) => {
     </div>
 
     <div class="badge-row">
-      <StatBadge label="差异条目" :value="totals.total" suffix="条" icon="Files" tone="primary" />
-      <StatBadge label="未解决" :value="totals.open" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="现行未解决" :value="totals.open" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="现行阻断" :value="totals.blocking" suffix="条" icon="WarningFilled" tone="warning" />
+      <StatBadge label="待重算" :value="totals.stale" suffix="条" icon="RefreshRight" tone="info" />
       <StatBadge label="已解决" :value="totals.resolved" suffix="条" icon="Grid" tone="success" />
-      <StatBadge label="阻断级" :value="totals.blocking" suffix="条" icon="WarningFilled" tone="warning" />
-      <StatBadge label="风险分" :value="totals.risk" suffix="分" icon="TrendCharts" tone="info" />
+      <StatBadge label="现行风险分" :value="totals.risk" suffix="分" icon="TrendCharts" tone="info" />
     </div>
 
     <FilterBar
@@ -141,7 +143,8 @@ watch(filters, (value) => {
         <div class="card-title">
           <span>场次核对小结</span>
           <span class="muted">
-            场次 {{ report.summary.sceneCount }} · 要素 {{ report.summary.elementCount }} · 现场记录 {{ report.summary.recordCount }} ·
+            在场次 {{ report.summary.sceneCount }}（撤下 {{ report.summary.withdrawnSceneCount }}）· 共同账 {{ report.summary.ledgerCount }}（跨场 {{ report.summary.multiSceneLedgerCount }}）·
+            现场记录 {{ report.summary.recordCount }} · 待重算 {{ report.summary.staleConflictCount }} · 草稿 {{ report.summary.draftCount }} · 隔离 {{ report.summary.quarantineCount }} ·
             风险最高场次 第 {{ report.summary.riskiestSceneNo }} 场
           </span>
         </div>
@@ -161,17 +164,24 @@ watch(filters, (value) => {
           </template>
         </el-table-column>
         <el-table-column prop="location" label="地点" min-width="140" />
-        <el-table-column prop="elementCount" label="要素数" width="90" align="right" />
-        <el-table-column prop="criticalElementCount" label="关键要素" width="100" align="right" />
-        <el-table-column label="未解决冲突" width="120" align="right">
+        <el-table-column prop="elementCount" label="要素数" width="80" align="right" />
+        <el-table-column prop="criticalElementCount" label="关键" width="70" align="right" />
+        <el-table-column label="现行未解决" width="100" align="right">
           <template #default="{ row }">
             <el-tag :type="row.openConflictCount > 0 ? 'danger' : 'success'" size="small" effect="plain">
               {{ row.openConflictCount }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="resolvedConflictCount" label="已解决" width="90" align="right" />
-        <el-table-column prop="shootDayCount" label="拍摄日" width="90" align="right" />
+        <el-table-column label="待重算" width="80" align="right">
+          <template #default="{ row }">
+            <el-tag :type="row.staleConflictCount > 0 ? 'warning' : 'info'" size="small" effect="plain">
+              {{ row.staleConflictCount }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="resolvedConflictCount" label="已解决" width="80" align="right" />
+        <el-table-column prop="shootDayCount" label="拍摄日" width="80" align="right" />
       </el-table>
     </el-card>
 
@@ -183,10 +193,13 @@ watch(filters, (value) => {
           </template>
           <el-descriptions :column="2" border size="small">
             <el-descriptions-item label="库名">{{ DB_NAME }}</el-descriptions-item>
-            <el-descriptions-item label="结构版本">v{{ DB_SCHEMA_VERSION }}</el-descriptions-item>
+            <el-descriptions-item label="结构版本">v{{ DB_SCHEMA_VERSION }}（共同账）</el-descriptions-item>
             <el-descriptions-item label="场次/要素">{{ dbCounts.scenes ?? 0 }} / {{ dbCounts.elements ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="拍摄日/记录">{{ dbCounts.shootDays ?? 0 }} / {{ dbCounts.records ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="共同账">{{ dbCounts.ledgers ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="差异">{{ dbCounts.conflicts ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="并发草稿">{{ dbCounts.drafts ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="隔离待确认">{{ dbCounts.quarantine ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="导出时间">{{ report?.exportedAt.slice(0, 19).replace('T', ' ') ?? '—' }}</el-descriptions-item>
           </el-descriptions>
           <div class="btn-row">

@@ -7,7 +7,7 @@ import { Plus } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import { db, type ElementRow, type RecordRow, type SceneRow } from '@/utils/db'
+import { db, type ElementRow, type RecordRow, type SceneRow, type LedgerRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useElementStore } from '@/stores/elementStore'
 import { ELEMENT_CATEGORIES, createEmptyElement, type Element, type ElementCategory } from '@/types/element'
@@ -24,6 +24,7 @@ const { rows: elements, ready } = useIdbTable<ElementRow>(() => db.elements, {
 })
 const { rows: scenes } = useIdbTable<SceneRow>(() => db.scenes, { compare: (a, b) => a.shootOrder - b.shootOrder })
 const { rows: records } = useIdbTable<RecordRow>(() => db.records)
+const { rows: ledgers } = useIdbTable<LedgerRow>(() => db.ledgers)
 
 const selects = computed<FilterSelectConfig[]>(() => [
   { key: 'categories', label: '类别', options: ELEMENT_CATEGORIES.map((item) => ({ label: item, value: item })) },
@@ -49,7 +50,7 @@ const filtered = computed(() => {
   const categories = Array.isArray(store.filters.categories) ? store.filters.categories : []
   const sceneIds = Array.isArray(store.filters.sceneIds) ? store.filters.sceneIds : []
   return elements.value.filter((element) => {
-    const label = `${element.name} ${element.initialState} ${element.owner}`.toLowerCase()
+    const label = `${element.name} ${element.initialState} ${element.owner} ${element.continuityNo}`.toLowerCase()
     if (keyword && !label.includes(keyword)) return false
     if (categories.length > 0 && !categories.includes(element.category)) return false
     if (sceneIds.length > 0 && !sceneIds.includes(element.sceneId)) return false
@@ -84,13 +85,15 @@ const grouped = computed<GroupedScene[]>(() => {
 })
 
 const totals = computed(() => {
-  const critical = elements.value.filter((item) => item.critical).length
+  const active = elements.value.filter((item) => item.status === '在用')
+  const critical = active.filter((item) => item.critical).length
   return {
-    elementCount: elements.value.length,
+    elementCount: active.length,
+    disabledCount: elements.value.filter((item) => item.status === '停用').length,
     criticalCount: critical,
-    criticalRatio: elements.value.length > 0 ? Math.round((critical / elements.value.length) * 100) : 0,
-    categoryCount: new Set(elements.value.map((item) => item.category)).size,
-    ownerCount: new Set(elements.value.map((item) => item.owner)).size
+    ledgerCount: new Set(active.map((item) => item.ledgerId).filter(Boolean)).size,
+    categoryCount: new Set(active.map((item) => item.category)).size,
+    ownerCount: new Set(active.map((item) => item.owner)).size
   }
 })
 
@@ -98,10 +101,16 @@ const totals = computed(() => {
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
-const form = reactive<Omit<Element, 'id'>>(createEmptyElement())
+const form = reactive<Omit<Element, 'id'>>({
+  ...createEmptyElement(),
+  ledgerId: '',
+  continuityNo: '',
+  status: '在用'
+})
 
 const rules: FormRules = {
   sceneId: [{ required: true, message: '请选择所属场次', trigger: 'change' }],
+  continuityNo: [{ required: true, message: '请填写连戏编号（同编号跨场共用一份基准）', trigger: 'blur' }],
   name: [{ required: true, message: '请填写要素名称', trigger: 'blur' }],
   initialState: [{ required: true, message: '请填写初始状态', trigger: 'blur' }]
 }
@@ -123,7 +132,10 @@ function openEdit(element: ElementRow): void {
     name: element.name,
     initialState: element.initialState,
     owner: element.owner,
-    critical: element.critical
+    critical: element.critical,
+    ledgerId: element.ledgerId,
+    continuityNo: element.continuityNo,
+    status: element.status
   })
   dialogVisible.value = true
 }
@@ -133,12 +145,44 @@ async function submit(): Promise<void> {
   if (!valid) return
   if (editingId.value) {
     await store.updateElement(editingId.value, { ...form })
-    ElMessage.success('连戏要素已更新')
+    ElMessage.success('连戏要素已更新，同名编号的共同账基准已同步')
   } else {
-    await store.createElement({ ...form })
-    ElMessage.success('连戏要素已登记')
+    // 新增要素即按编号归共同账：已存在编号则挂接本场，新编号则建账
+    const { commitLedger } = await import('@/utils/db')
+    const existing = ledgers.value.find((item) => item.code === form.continuityNo.trim())
+    const result = await commitLedger({
+      id: existing?.id,
+      expectedVersion: existing?.version ?? 0,
+      actor: '要素登记页',
+      data: {
+        code: form.continuityNo.trim(),
+        category: form.category,
+        name: form.name,
+        sceneIds: existing && !existing.sceneIds.includes(form.sceneId)
+          ? [...existing.sceneIds, form.sceneId]
+          : existing?.sceneIds ?? [form.sceneId],
+        baseline: {
+          state: form.initialState,
+          photoNote: existing?.baseline.photoNote ?? ''
+        },
+        owner: form.owner || existing?.owner || '',
+        critical: form.critical || existing?.critical || false,
+        status: '在用'
+      }
+    })
+    if (result.outcome === 'conflict') {
+      ElMessage.warning('该编号正被另一标签页修改，表格草稿已保留，请到「共同账」页处理')
+    } else {
+      ElMessage.success(existing ? '已挂接到既有连戏编号的共同账' : '已建立共同账并登记要素')
+    }
   }
   dialogVisible.value = false
+}
+
+async function toggleStatus(element: ElementRow): Promise<void> {
+  const next = element.status === '停用' ? '在用' : '停用'
+  await store.changeStatus(element.id, next)
+  ElMessage.success(next === '停用' ? '道具已停用，相关差异转为待重算' : '道具已重新启用')
 }
 
 async function remove(element: ElementRow): Promise<void> {
@@ -168,6 +212,10 @@ function onFilterChange(next: FilterModel): void {
   store.setFilters(next)
 }
 
+function elementRowClass({ row }: { row: ElementRow }): string {
+  return row.status === '停用' ? 'row-disabled' : ''
+}
+
 onMounted(() => {
   store.applyQuery(route.query)
 })
@@ -192,9 +240,10 @@ watch(
     </div>
 
     <div class="badge-row">
-      <StatBadge label="要素总数" :value="totals.elementCount" suffix="项" icon="Files" tone="primary" />
+      <StatBadge label="在用要素" :value="totals.elementCount" suffix="项" icon="Files" tone="primary" />
+      <StatBadge label="连戏编号" :value="totals.ledgerCount" suffix="个" icon="CollectionTag" tone="primary" />
+      <StatBadge label="停用道具" :value="totals.disabledCount" suffix="项" icon="Remove" tone="info" />
       <StatBadge label="关键要素" :value="totals.criticalCount" suffix="项" icon="WarningFilled" tone="danger" />
-      <StatBadge label="关键占比" :value="totals.criticalRatio" :percent="totals.criticalRatio" show-percent icon="PieChart" tone="warning" />
       <StatBadge label="覆盖类别" :value="totals.categoryCount" suffix="类" icon="Grid" tone="info" />
       <StatBadge label="责任人" :value="totals.ownerCount" suffix="人" icon="DataLine" tone="success" />
     </div>
@@ -227,24 +276,43 @@ watch(
           <el-tag size="small" effect="dark">{{ categoryGroup.category }}</el-tag>
           <span class="muted">{{ categoryGroup.items.length }} 项</span>
         </div>
-        <el-table :data="categoryGroup.items" stripe border size="small">
-          <el-table-column prop="name" label="要素名称" min-width="150" />
-          <el-table-column prop="initialState" label="初始状态（连戏基准）" min-width="220" />
-          <el-table-column prop="owner" label="责任人" width="140" />
-          <el-table-column label="关键" width="90">
+        <el-table
+          :data="categoryGroup.items"
+          stripe
+          border
+          size="small"
+          :row-class-name="elementRowClass"
+        >
+          <el-table-column prop="continuityNo" label="连戏编号" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" type="primary" effect="plain">{{ row.continuityNo || '待编号' }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="name" label="要素名称" min-width="140" />
+          <el-table-column prop="initialState" label="当前基准（共同账唯一）" min-width="220" />
+          <el-table-column prop="owner" label="责任人" width="130" />
+          <el-table-column label="关键" width="80">
             <template #default="{ row }">
               <el-tag :type="row.critical ? 'danger' : 'info'" size="small" effect="plain">
                 {{ row.critical ? '关键' : '一般' }}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="现场记录" width="100" align="right">
+          <el-table-column label="状态" width="80">
+            <template #default="{ row }">
+              <el-tag :type="row.status === '停用' ? 'info' : 'success'" size="small" effect="plain">{{ row.status }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="现场记录" width="90" align="right">
             <template #default="{ row }">{{ recordCountOf(row.id) }} 次</template>
           </el-table-column>
-          <el-table-column label="操作" width="240" fixed="right">
+          <el-table-column label="操作" width="310" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" size="small" @click="gotoLog(row)">去记录</el-button>
               <el-button link size="small" @click="toggleCritical(row)">{{ row.critical ? '取消关键' : '设为关键' }}</el-button>
+              <el-button link :type="row.status === '停用' ? 'success' : 'warning'" size="small" @click="toggleStatus(row)">
+                {{ row.status === '停用' ? '启用' : '停用' }}
+              </el-button>
               <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
               <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
             </template>
@@ -259,6 +327,9 @@ watch(
           <el-select v-model="form.sceneId" class="full" placeholder="选择场次">
             <el-option v-for="item in scenes" :key="item.id" :label="`第 ${item.sceneNo} 场 · ${item.location}`" :value="item.id" />
           </el-select>
+        </el-form-item>
+        <el-form-item label="连戏编号" prop="continuityNo">
+          <el-input v-model="form.continuityNo" placeholder="如：LX-001，同一编号跨场次共用一份基准" />
         </el-form-item>
         <el-form-item label="类别">
           <el-radio-group v-model="form.category">
@@ -300,5 +371,10 @@ watch(
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+}
+
+:deep(.row-disabled) {
+  background-color: #f4f6f8;
+  color: #9aa5ad;
 }
 </style>

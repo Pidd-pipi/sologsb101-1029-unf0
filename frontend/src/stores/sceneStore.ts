@@ -1,12 +1,23 @@
 /**
  * 场次 store：维护场次列表、拍摄顺序与筛选条件。
+ * 撤下场次不做物理删除（退出排程、差异待重算、历史保留）；
+ * 只有撤下后的误建场次才允许「彻底删除」。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
 import type { Scene } from '@/types/scene'
 import type { FilterModel } from '@/types/filter'
-import { nextShootOrder, putScene, removeScene, reorderScenes, updateScene as updateSceneRow, ROW_REVISION } from '@/utils/db'
+import {
+  nextShootOrder,
+  purgeScene,
+  putScene,
+  restoreScene as restoreSceneRow,
+  reorderScenes,
+  updateScene as updateSceneRow,
+  withdrawScene as withdrawSceneRow,
+  ROW_REVISION
+} from '@/utils/db'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
@@ -36,7 +47,7 @@ export const useSceneStore = defineStore('scene', () => {
     const now = Date.now()
     const id = createId('scene')
     const shootOrder = await nextShootOrder()
-    await putScene({ ...payload, id, shootOrder, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+    await putScene({ ...payload, id, shootOrder, withdrawn: false, revision: ROW_REVISION, createdAt: now, updatedAt: now })
     selectedSceneId.value = id
     return id
   }
@@ -45,8 +56,19 @@ export const useSceneStore = defineStore('scene', () => {
     await updateSceneRow(id, patch)
   }
 
-  async function deleteScene(id: string): Promise<void> {
-    await removeScene(id)
+  /** 撤下场次：历史保留，相关差异转待重算 */
+  async function withdrawScene(id: string, actor = '现场'): Promise<void> {
+    await withdrawSceneRow(id, actor)
+  }
+
+  /** 恢复撤下的场次 */
+  async function restoreScene(id: string, actor = '现场'): Promise<void> {
+    await restoreSceneRow(id, actor)
+  }
+
+  /** 彻底删除（仅限撤下后的误建场次） */
+  async function purgeSceneById(id: string, actor = '现场'): Promise<void> {
+    await purgeScene(id, actor)
     if (selectedSceneId.value === id) selectedSceneId.value = null
   }
 
@@ -68,7 +90,9 @@ export const useSceneStore = defineStore('scene', () => {
     select,
     createScene,
     updateScene,
-    deleteScene,
+    withdrawScene,
+    restoreScene,
+    purgeSceneById,
     move
   }
 })

@@ -6,7 +6,7 @@ import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
 import type { Element } from '@/types/element'
 import type { FilterModel } from '@/types/filter'
-import { putElement, removeElement, updateElement as updateElementRow, ROW_REVISION } from '@/utils/db'
+import { putElement, removeElement, setElementStatus, updateElement as updateElementRow, ROW_REVISION } from '@/utils/db'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 
@@ -49,5 +49,10 @@ export const useElementStore = defineStore('element', () => {
     if (selectedElementId.value === id) selectedElementId.value = null
   }
 
-  return { filters, selectedElementId, setFilters, resetFilters, applyQuery, select, createElement, updateElement, deleteElement }
+  /** 停用 / 启用道具：停用后相关差异立即转待重算，历史保留 */
+  async function changeStatus(id: string, status: Element['status']): Promise<void> {
+    await setElementStatus(id, status)
+  }
+
+  return { filters, selectedElementId, setFilters, resetFilters, applyQuery, select, createElement, updateElement, deleteElement, changeStatus }
 })

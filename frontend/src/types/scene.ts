@@ -5,7 +5,11 @@ export type SceneTimeOfDay = '日' | '夜' | '晨' | '昏'
 /** 场次拍摄状态 */
 export type SceneState = '未拍' | '拍摄中' | '已过'
 
-/** 剧本场次：连戏核对的最小单位 */
+/**
+ * 剧本场次：连戏核对的最小单位。
+ * 撤下场次不做物理删除：withdrawn=true 后退出排程与差异比对，
+ * 其要素、现场记录与差异痕迹全部保留，涉及差异转待重算。
+ */
 export interface Scene {
   id: string
   /** 场号，如 12A */
@@ -22,6 +26,8 @@ export interface Scene {
   shootOrder: number
   /** 拍摄状态 */
   state: SceneState
+  /** 是否已撤下（撤下保留全部历史，只是退出比对与排程） */
+  withdrawn: boolean
 }
 
 export const SCENE_PLACES: ScenePlace[] = ['内景', '外景']
@@ -29,7 +35,7 @@ export const SCENE_TIMES: SceneTimeOfDay[] = ['日', '夜', '晨', '昏']
 export const SCENE_STATES: SceneState[] = ['未拍', '拍摄中', '已过']
 
 export function createEmptyScene(): Omit<Scene, 'id' | 'shootOrder'> {
-  return { sceneNo: '', place: '内景', timeOfDay: '日', location: '', excerpt: '', state: '未拍' }
+  return { sceneNo: '', place: '内景', timeOfDay: '日', location: '', excerpt: '', state: '未拍', withdrawn: false }
 }
 
 /** 场次卡片回显的派生统计 */

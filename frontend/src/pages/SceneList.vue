@@ -8,7 +8,7 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import ConflictTag from '@/components/common/ConflictTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import { db, type ConflictRow, type ElementRow, type SceneRow } from '@/utils/db'
+import { db, type ConflictRow, type ElementRow, type SceneRow, type LedgerRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useSceneStore } from '@/stores/sceneStore'
 import { SCENE_PLACES, SCENE_STATES, SCENE_TIMES, createEmptyScene, type Scene } from '@/types/scene'
@@ -25,20 +25,28 @@ const { rows: scenes, ready } = useIdbTable<SceneRow>(() => db.scenes, {
 })
 const { rows: elements } = useIdbTable<ElementRow>(() => db.elements)
 const { rows: conflicts } = useIdbTable<ConflictRow>(() => db.conflicts)
+const { rows: ledgers } = useIdbTable<LedgerRow>(() => db.ledgers)
 
 const selects: FilterSelectConfig[] = [
   { key: 'places', label: '内外景', options: SCENE_PLACES.map((item) => ({ label: item, value: item })) },
   { key: 'times', label: '时间', options: SCENE_TIMES.map((item) => ({ label: item, value: item })) }
 ]
 
-/** 该场的连戏要素数与未解决冲突数 */
+/** 该场的连戏要素数与未解决现行冲突数（待重算不计入风险） */
 function elementCountOf(sceneId: string): number {
   return elements.value.filter((item) => item.sceneId === sceneId).length
 }
 
 function openConflictCountOf(sceneId: string): number {
-  const elementIds = elements.value.filter((item) => item.sceneId === sceneId).map((item) => item.id)
-  return conflicts.value.filter((item) => elementIds.includes(item.elementId) && item.state === '待确认').length
+  const ledgerIds = new Set(
+    ledgers.value.filter((item) => item.sceneIds.includes(sceneId)).map((item) => item.id)
+  )
+  return conflicts.value.filter(
+    (item) =>
+      item.state === '待确认' &&
+      item.stale === '现行' &&
+      (ledgerIds.has(item.ledgerId) || elements.value.some((e) => e.id === item.elementId && e.sceneId === sceneId))
+  ).length
 }
 
 const filtered = computed(() => {
@@ -53,19 +61,24 @@ const filtered = computed(() => {
       if (times.length > 0 && !times.includes(scene.timeOfDay)) return false
       return true
     })
-    .sort((a, b) => a.shootOrder - b.shootOrder)
+    .sort((a, b) => Number(a.withdrawn) - Number(b.withdrawn) || a.shootOrder - b.shootOrder)
 })
 
 const totals = computed(() => {
-  const open = conflicts.value.filter((item) => item.state === '待确认')
+  const open = conflicts.value.filter((item) => item.state === '待确认' && item.stale === '现行')
   return {
-    sceneCount: scenes.value.length,
+    sceneCount: scenes.value.filter((item) => !item.withdrawn).length,
+    withdrawnCount: scenes.value.filter((item) => item.withdrawn).length,
     elementCount: elements.value.length,
     openConflictCount: open.length,
     blockingCount: open.filter((item) => item.severity === '阻断').length,
-    shotCount: scenes.value.filter((item) => item.state === '已过').length,
-    shotRatio: scenes.value.length > 0 ? Math.round((scenes.value.filter((i) => i.state === '已过').length / scenes.value.length) * 100) : 0
+    shotCount: scenes.value.filter((item) => item.state === '已过' && !item.withdrawn).length
   }
+})
+
+const shotRatio = computed(() => {
+  const active = scenes.value.filter((item) => !item.withdrawn)
+  return active.length > 0 ? Math.round((active.filter((i) => i.state === '已过').length / active.length) * 100) : 0
 })
 
 /* ------------------------------ 拖拽调序 ------------------------------ */
@@ -136,18 +149,37 @@ async function submit(): Promise<void> {
   dialogVisible.value = false
 }
 
-async function remove(scene: SceneRow): Promise<void> {
+async function withdraw(scene: SceneRow): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `删除场次 ${scene.sceneNo} 会级联删除其连戏要素、现场记录与差异条目，是否继续？`,
-      '删除确认',
-      { type: 'warning', confirmButtonText: '确认删除' }
+      `撤下第 ${scene.sceneNo} 场后将退出拍摄排程，现场记录与差异历史全部保留，涉及差异立即转「待重算」。是否继续？`,
+      '撤下确认',
+      { type: 'warning', confirmButtonText: '确认撤下' }
     )
   } catch {
     return
   }
-  await store.deleteScene(scene.id)
-  ElMessage.success('场次及其下级记录已删除')
+  await store.withdrawScene(scene.id)
+  ElMessage.success('场次已撤下，相关差异转为待重算')
+}
+
+async function restore(scene: SceneRow): Promise<void> {
+  await store.restoreScene(scene.id)
+  ElMessage.success('场次已恢复排程，请重新比对差异')
+}
+
+async function purge(scene: SceneRow): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `彻底删除第 ${scene.sceneNo} 场会级联删除其要素与现场记录（共同账与历史留痕仍保留）。仅应对误建场次使用，是否继续？`,
+      '彻底删除确认',
+      { type: 'warning', confirmButtonText: '确认彻底删除' }
+    )
+  } catch {
+    return
+  }
+  await store.purgeSceneById(scene.id)
+  ElMessage.success('误建场次已彻底删除')
 }
 
 async function changeState(scene: SceneRow, state: Scene['state']): Promise<void> {
@@ -191,12 +223,12 @@ watch(
     </div>
 
     <div class="badge-row">
-      <StatBadge label="场次数" :value="totals.sceneCount" suffix="场" icon="Files" tone="primary" />
+      <StatBadge label="在场场次" :value="totals.sceneCount" suffix="场" icon="Files" tone="primary" />
+      <StatBadge label="已撤下" :value="totals.withdrawnCount" suffix="场" icon="Remove" tone="info" />
       <StatBadge label="连戏要素" :value="totals.elementCount" suffix="项" icon="Grid" tone="info" />
-      <StatBadge label="未解决冲突" :value="totals.openConflictCount" suffix="条" icon="WarningFilled" tone="danger" />
-      <StatBadge label="阻断级" :value="totals.blockingCount" suffix="条" icon="WarningFilled" tone="warning" />
-      <StatBadge label="已过场次" :value="totals.shotCount" suffix="场" icon="TrendCharts" tone="success" />
-      <StatBadge label="拍摄进度" :value="totals.shotRatio" :percent="totals.shotRatio" show-percent icon="PieChart" tone="primary" />
+      <StatBadge label="现行未解决" :value="totals.openConflictCount" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="现行阻断" :value="totals.blockingCount" suffix="条" icon="WarningFilled" tone="warning" />
+      <StatBadge label="拍摄进度" :value="shotRatio" :percent="shotRatio" show-percent icon="PieChart" tone="primary" />
     </div>
 
     <FilterBar
@@ -220,42 +252,52 @@ watch(
         v-for="(scene, index) in filtered"
         :key="scene.id"
         class="scene-card"
-        :class="{ 'is-dragging': dragIndex === index, 'is-over': overIndex === index }"
-        draggable="true"
+        :class="{ 'is-dragging': dragIndex === index, 'is-over': overIndex === index, 'is-withdrawn': scene.withdrawn }"
+        :draggable="!scene.withdrawn"
         @dragstart="onDragStart(index)"
         @dragover.prevent="onDragOver(index)"
         @drop.prevent="onDrop(index)"
         @dragend="dragIndex = null"
       >
-        <el-icon class="drag-handle"><Rank /></el-icon>
+        <el-icon v-if="!scene.withdrawn" class="drag-handle"><Rank /></el-icon>
         <div class="scene-card__order">#{{ index + 1 }}</div>
         <div class="scene-card__body">
           <div class="scene-card__title">
             <strong>第 {{ scene.sceneNo }} 场</strong>
             <el-tag size="small" effect="plain">{{ scene.place }} · {{ scene.timeOfDay }}</el-tag>
-            <ConflictTag :state="scene.state" />
-            <el-tag v-if="openConflictCountOf(scene.id) > 0" type="danger" size="small" effect="plain">
-              未解决冲突 {{ openConflictCountOf(scene.id) }}
+            <ConflictTag v-if="!scene.withdrawn" :state="scene.state" />
+            <el-tag v-else type="info" size="small" effect="dark">已撤下</el-tag>
+            <el-tag v-if="scene.withdrawn && openConflictCountOf(scene.id) === 0" type="info" size="small" effect="plain">
+              不参与比对
+            </el-tag>
+            <el-tag v-else-if="openConflictCountOf(scene.id) > 0" type="danger" size="small" effect="plain">
+              现行未解决 {{ openConflictCountOf(scene.id) }}
             </el-tag>
           </div>
           <div class="scene-card__meta">{{ scene.location }} · 连戏要素 {{ elementCountOf(scene.id) }} 项</div>
           <div class="scene-card__excerpt">{{ scene.excerpt }}</div>
         </div>
         <div class="scene-card__actions">
-          <el-button link size="small" :disabled="index === 0" @click="moveBy(index, -1)">上移</el-button>
-          <el-button link size="small" :disabled="index === filtered.length - 1" @click="moveBy(index, 1)">下移</el-button>
-          <el-button link type="primary" size="small" @click="gotoElements(scene)">要素</el-button>
-          <el-button link type="primary" size="small" @click="gotoConflicts(scene)">差异</el-button>
-          <el-dropdown trigger="click" @command="(cmd: string) => changeState(scene, cmd as Scene['state'])">
-            <el-button link type="warning" size="small">状态</el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item v-for="item in SCENE_STATES" :key="item" :command="item">{{ item }}</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-          <el-button link type="primary" size="small" @click="openEdit(scene)">编辑</el-button>
-          <el-button link type="danger" size="small" @click="remove(scene)">删除</el-button>
+          <template v-if="scene.withdrawn">
+            <el-button link type="success" size="small" @click="restore(scene)">恢复排程</el-button>
+            <el-button link type="danger" size="small" @click="purge(scene)">彻底删除</el-button>
+          </template>
+          <template v-else>
+            <el-button link size="small" :disabled="index === 0" @click="moveBy(index, -1)">上移</el-button>
+            <el-button link size="small" :disabled="index === filtered.length - 1" @click="moveBy(index, 1)">下移</el-button>
+            <el-button link type="primary" size="small" @click="gotoElements(scene)">要素</el-button>
+            <el-button link type="primary" size="small" @click="gotoConflicts(scene)">差异</el-button>
+            <el-dropdown trigger="click" @command="(cmd: string) => changeState(scene, cmd as Scene['state'])">
+              <el-button link type="warning" size="small">状态</el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item v-for="item in SCENE_STATES" :key="item" :command="item">{{ item }}</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+            <el-button link type="primary" size="small" @click="openEdit(scene)">编辑</el-button>
+            <el-button link type="danger" size="small" @click="withdraw(scene)">撤下</el-button>
+          </template>
         </div>
       </div>
     </div>
@@ -323,6 +365,12 @@ watch(
 
 .scene-card.is-over {
   border-top: 2px dashed #2f5d8a;
+}
+
+.scene-card.is-withdrawn {
+  opacity: 0.62;
+  border-left-color: #9aa5ad;
+  background: #f4f6f8;
 }
 
 .scene-card__order {

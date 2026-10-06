@@ -8,7 +8,7 @@ import ConflictTag from '@/components/common/ConflictTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
-import { db, type ConflictRow, type ElementRow, type RecordRow, type SceneRow, type ShootDayRow } from '@/utils/db'
+import { db, type ConflictRow, type ElementRow, type RecordRow, type SceneRow, type ShootDayRow, type LedgerRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useRecordStore } from '@/stores/recordStore'
 import { createEmptyShootDay, type ShootDay } from '@/types/shootDay'
@@ -27,6 +27,7 @@ const { rows: records } = useIdbTable<RecordRow>(() => db.records)
 const { rows: elements } = useIdbTable<ElementRow>(() => db.elements)
 const { rows: scenes } = useIdbTable<SceneRow>(() => db.scenes, { compare: (a, b) => a.shootOrder - b.shootOrder })
 const { rows: conflicts } = useIdbTable<ConflictRow>(() => db.conflicts)
+const { rows: ledgers } = useIdbTable<LedgerRow>(() => db.ledgers)
 
 const selects = computed<FilterSelectConfig[]>(() => [
   { key: 'sceneIds', label: '场次', options: scenes.value.map((item) => ({ label: `第 ${item.sceneNo} 场`, value: item.id })) },
@@ -64,20 +65,23 @@ const dayRecords = computed(() =>
     .sort((a, b) => a.takeNo.localeCompare(b.takeNo, 'zh-Hans-CN'))
 )
 
-/** 该记录是否涉及未解决差异 */
+/** 该记录涉及的差异（优先取现行，待重算也提示） */
 function conflictOf(recordId: string): ConflictRow | null {
-  return conflicts.value.find((item) => item.recordIdA === recordId || item.recordIdB === recordId) ?? null
+  const related = conflicts.value.filter((item) => item.recordIdA === recordId || item.recordIdB === recordId)
+  return related.find((item) => item.stale === '现行') ?? related[0] ?? null
 }
 
 const totals = computed(() => {
-  const open = conflicts.value.filter((item) => item.state === '待确认')
+  const open = conflicts.value.filter((item) => item.state === '待确认' && item.stale === '现行')
   return {
     shootDayCount: shootDays.value.length,
     recordCount: records.value.length,
     dayRecordCount: dayRecords.value.length,
     openConflictCount: open.length,
     blockingCount: open.filter((item) => item.severity === '阻断').length,
-    elementCount: elements.value.length
+    staleCount: conflicts.value.filter((item) => item.stale === '待重算').length,
+    elementCount: elements.value.length,
+    ledgerCount: ledgers.value.length
   }
 })
 
@@ -135,7 +139,7 @@ async function submitDay(): Promise<void> {
 
 async function removeDay(day: ShootDayRow): Promise<void> {
   try {
-    await ElMessageBox.confirm(`删除拍摄日 ${day.date} 会同时删除当日现场记录与相关差异，是否继续？`, '删除确认', {
+    await ElMessageBox.confirm(`删除拍摄日 ${day.date} 会移除当日现场记录，相关差异转为「待重算」（历史保留），是否继续？`, '删除确认', {
       type: 'warning',
       confirmButtonText: '确认删除'
     })
@@ -143,7 +147,7 @@ async function removeDay(day: ShootDayRow): Promise<void> {
     return
   }
   await store.deleteShootDay(day.id)
-  ElMessage.success('拍摄日及其记录已删除')
+  ElMessage.success('拍摄日已删除，相关差异转为待重算')
 }
 
 /* ------------------------------ 现场记录 ------------------------------ */
@@ -187,12 +191,17 @@ function openEditRecord(record: RecordRow): void {
   recordDialog.value = true
 }
 
-/** 选中要素后自动带出所属场次与初始状态，减少手填 */
+/** 选中要素后自动带出所属场次、连戏编号与当前基准，减少手填 */
 function onElementChange(elementId: string): void {
   const element = elementOf(elementId)
   if (!element) return
   recordForm.sceneId = element.sceneId
-  if (!recordForm.currentState) recordForm.currentState = element.initialState
+  recordForm.ledgerId = element.ledgerId
+  recordForm.continuityNo = element.continuityNo
+  if (!recordForm.currentState) {
+    const ledger = ledgers.value.find((item) => item.id === element.ledgerId)
+    recordForm.currentState = ledger?.baseline.state ?? element.initialState
+  }
 }
 
 async function submitRecord(): Promise<void> {
@@ -214,12 +223,12 @@ async function submitRecord(): Promise<void> {
 
 async function removeRecord(record: RecordRow): Promise<void> {
   try {
-    await ElMessageBox.confirm('删除该现场记录会同时删除与之关联的差异条目，是否继续？', '删除确认', { type: 'warning' })
+    await ElMessageBox.confirm('删除该现场记录后，相关差异转为「待重算」（历史留痕保留，不会直接删差异），是否继续？', '删除确认', { type: 'warning' })
   } catch {
     return
   }
   await store.deleteRecord(record.id)
-  ElMessage.success('现场记录已删除')
+  ElMessage.success('现场记录已删除，相关差异转为待重算')
 }
 
 function onFilterChange(next: FilterModel): void {
@@ -263,10 +272,11 @@ watch(currentDay, (day) => {
 
     <div class="badge-row">
       <StatBadge label="拍摄日" :value="totals.shootDayCount" suffix="天" icon="Files" tone="primary" />
+      <StatBadge label="连戏编号" :value="totals.ledgerCount" suffix="个" icon="CollectionTag" tone="primary" />
       <StatBadge label="现场记录" :value="totals.recordCount" suffix="条" icon="DataLine" tone="info" />
       <StatBadge label="当日记录" :value="totals.dayRecordCount" suffix="条" icon="Grid" tone="success" />
-      <StatBadge label="未解决冲突" :value="totals.openConflictCount" suffix="条" icon="WarningFilled" tone="danger" />
-      <StatBadge label="阻断级" :value="totals.blockingCount" suffix="条" icon="WarningFilled" tone="warning" />
+      <StatBadge label="现行未解决" :value="totals.openConflictCount" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="待重算" :value="totals.staleCount" suffix="条" icon="RefreshRight" tone="warning" />
     </div>
 
     <FilterBar
@@ -347,26 +357,35 @@ watch(currentDay, (day) => {
             @create="openCreateRecord"
           />
           <el-table v-else :data="dayRecords" stripe border>
-            <el-table-column label="连戏要素" min-width="170">
+            <el-table-column label="连戏编号" width="105">
+              <template #default="{ row }">
+                <el-tag size="small" type="primary" effect="plain">{{ row.continuityNo || '待编号' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="连戏要素" min-width="160">
               <template #default="{ row }">
                 <div>{{ elementOf(row.elementId)?.name ?? '要素已删除' }}</div>
                 <div class="muted">{{ elementOf(row.elementId)?.category ?? '—' }} · {{ elementOf(row.elementId)?.owner ?? '—' }}</div>
               </template>
             </el-table-column>
-            <el-table-column label="场次" width="160">
+            <el-table-column label="场次" width="150">
               <template #default="{ row }">{{ sceneLabel(row.sceneId) }}</template>
             </el-table-column>
-            <el-table-column prop="takeNo" label="镜次" width="90" />
-            <el-table-column prop="currentState" label="当前状态" min-width="200" />
-            <el-table-column prop="photoNote" label="照片说明" min-width="150" />
-            <el-table-column prop="recordedBy" label="记录人" width="100" />
-            <el-table-column label="差异" width="150">
+            <el-table-column prop="takeNo" label="镜次" width="80" />
+            <el-table-column prop="currentState" label="当前状态" min-width="190" />
+            <el-table-column prop="photoNote" label="照片说明" min-width="140" />
+            <el-table-column prop="recordedBy" label="记录人" width="90" />
+            <el-table-column label="差异" width="160">
               <template #default="{ row }">
-                <ConflictTag
-                  v-if="conflictOf(row.id)"
-                  :severity="conflictOf(row.id)?.severity"
-                  :state="conflictOf(row.id)?.state"
-                />
+                <template v-if="conflictOf(row.id)">
+                  <ConflictTag
+                    :severity="conflictOf(row.id)?.severity"
+                    :state="conflictOf(row.id)?.stale === '待重算' ? '' : conflictOf(row.id)?.state"
+                  />
+                  <el-tag v-if="conflictOf(row.id)?.stale === '待重算'" type="warning" size="small" effect="dark" round>
+                    待重算
+                  </el-tag>
+                </template>
                 <span v-else class="muted">—</span>
               </template>
             </el-table-column>

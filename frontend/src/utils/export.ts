@@ -1,14 +1,28 @@
 /**
- * 连戏核对报告 JSON 序列化与校验
+ * 连戏核对报告 JSON 序列化与校验（共同账版）
  * 报告页用于导出整份核对报告，也是「导入导出备份」的数据校验入口。
+ * 风险口径：「待重算」差异是旧基准产物，一律不计入现行风险，避免报告互相打架。
  */
 import type { Scene } from '../types/scene'
 import type { Element } from '../types/element'
 import type { ShootDay } from '../types/shootDay'
 import type { Record as ContinuityRecord } from '../types/record'
 import type { Conflict } from '../types/conflict'
+import type { ContinuityLedger, LedgerDraft, LedgerHistoryEntry, QuarantineItem } from '../types/ledger'
 import { SEVERITY_WEIGHT } from './diff'
-import { DB_NAME, DB_SCHEMA_VERSION, listConflicts, listElements, listRecords, listScenes, listShootDays } from './db'
+import {
+  DB_NAME,
+  DB_SCHEMA_VERSION,
+  listConflicts,
+  listElements,
+  listLedgers,
+  listRecords,
+  listScenes,
+  listShootDays,
+  listDrafts,
+  listLedgerHistory,
+  listQuarantine
+} from './db'
 import { nowIso } from './uuid'
 
 /** 单个场次的核对小结 */
@@ -19,9 +33,11 @@ export interface SceneReportRow {
   timeOfDay: string
   location: string
   state: string
+  withdrawn: boolean
   elementCount: number
   criticalElementCount: number
   openConflictCount: number
+  staleConflictCount: number
   resolvedConflictCount: number
   shootDayCount: number
 }
@@ -36,14 +52,24 @@ export interface ContinuityReport {
   shootDays: ShootDay[]
   records: ContinuityRecord[]
   conflicts: Conflict[]
+  ledgers: ContinuityLedger[]
+  ledgerHistory: LedgerHistoryEntry[]
+  ledgerDrafts: LedgerDraft[]
+  quarantine: QuarantineItem[]
   summary: {
     sceneCount: number
+    withdrawnSceneCount: number
+    ledgerCount: number
+    multiSceneLedgerCount: number
     elementCount: number
     recordCount: number
     openConflictCount: number
+    staleConflictCount: number
     blockedConflictCount: number
     resolvedConflictCount: number
-    /** 未解决冲突最多的场次 */
+    draftCount: number
+    quarantineCount: number
+    /** 现行未解决冲突最多的场次 */
     riskiestSceneNo: string
     rows: SceneReportRow[]
   }
@@ -59,40 +85,53 @@ function stripRevision<T extends WithRevision>(row: T): T {
   return copy as T
 }
 
-/** 汇总整份连戏核对报告 */
+/** 汇总整份连戏核对报告（待重算差异不进现行风险） */
 export async function buildReport(): Promise<ContinuityReport> {
-  const [scenes, elements, shootDays, records, conflicts] = await Promise.all([
-    listScenes(),
-    listElements(),
-    listShootDays(),
-    listRecords(),
-    listConflicts()
-  ])
+  const [scenes, elements, shootDays, records, conflicts, ledgers, ledgerHistory, ledgerDrafts, quarantine] =
+    await Promise.all([
+      listScenes(),
+      listElements(),
+      listShootDays(),
+      listRecords(),
+      listConflicts(),
+      listLedgers(),
+      listLedgerHistory(),
+      listDrafts(),
+      listQuarantine()
+    ])
 
   const rows: SceneReportRow[] = scenes.map((scene) => {
     const sceneElements = elements.filter((item) => item.sceneId === scene.id)
-    const elementIds = sceneElements.map((item) => item.id)
-    const sceneConflicts = conflicts.filter((item) => elementIds.includes(item.elementId))
+    const ledgerIds = new Set(
+      ledgers.filter((ledger) => ledger.sceneIds.includes(scene.id)).map((ledger) => ledger.id)
+    )
+    const sceneConflicts = conflicts.filter(
+      (item) =>
+        ledgerIds.has(item.ledgerId) || sceneElements.some((element) => element.id === item.elementId)
+    )
     return {
       sceneId: scene.id,
       sceneNo: scene.sceneNo,
       place: scene.place,
       timeOfDay: scene.timeOfDay,
       location: scene.location,
-      state: scene.state,
+      state: scene.withdrawn ? '已撤下' : scene.state,
+      withdrawn: scene.withdrawn,
       elementCount: sceneElements.length,
       criticalElementCount: sceneElements.filter((item) => item.critical).length,
-      openConflictCount: sceneConflicts.filter((item) => item.state === '待确认').length,
+      openConflictCount: sceneConflicts.filter((item) => item.state === '待确认' && item.stale === '现行').length,
+      staleConflictCount: sceneConflicts.filter((item) => item.stale === '待重算').length,
       resolvedConflictCount: sceneConflicts.filter((item) => item.state === '已解决').length,
       shootDayCount: shootDays.filter((day) => day.sceneIds.includes(scene.id)).length
     }
   })
 
-  const riskiest = [...rows].sort(
-    (a, b) => b.openConflictCount - a.openConflictCount || b.criticalElementCount - a.criticalElementCount
-  )[0]
+  const riskiest = [...rows]
+    .filter((row) => !row.withdrawn)
+    .sort((a, b) => b.openConflictCount - a.openConflictCount || b.criticalElementCount - a.criticalElementCount)[0]
 
-  const openConflicts = conflicts.filter((item) => item.state === '待确认')
+  const current = conflicts.filter((item) => item.stale === '现行')
+  const openConflicts = current.filter((item) => item.state === '待确认')
 
   return {
     name: DB_NAME,
@@ -103,22 +142,34 @@ export async function buildReport(): Promise<ContinuityReport> {
     shootDays: shootDays.map(stripRevision),
     records: records.map(stripRevision),
     conflicts: conflicts.map(stripRevision),
+    ledgers: ledgers.map(stripRevision),
+    ledgerHistory: ledgerHistory.map(({ revision, createdAt, updatedAt, ...rest }) => rest),
+    ledgerDrafts: ledgerDrafts.map(({ revision, updatedAt, ...rest }) => rest),
+    quarantine,
     summary: {
-      sceneCount: scenes.length,
+      sceneCount: scenes.filter((item) => !item.withdrawn).length,
+      withdrawnSceneCount: scenes.filter((item) => item.withdrawn).length,
+      ledgerCount: ledgers.length,
+      multiSceneLedgerCount: ledgers.filter((item) => item.sceneIds.length > 1).length,
       elementCount: elements.length,
       recordCount: records.length,
       openConflictCount: openConflicts.length,
+      staleConflictCount: conflicts.filter((item) => item.stale === '待重算').length,
       blockedConflictCount: openConflicts.filter((item) => item.severity === '阻断').length,
       resolvedConflictCount: conflicts.filter((item) => item.state === '已解决').length,
+      draftCount: ledgerDrafts.length,
+      quarantineCount: quarantine.filter((item) => item.state === '待确认').length,
       riskiestSceneNo: riskiest ? riskiest.sceneNo : '—',
       rows
     }
   }
 }
 
-/** 严重程度加权后的风险分：用于报告页排序 */
+/** 严重程度加权后的现行风险分：待重算差异不参与，防止旧基准抬高风险 */
 export function riskScore(conflicts: Conflict[]): number {
-  return conflicts.reduce((sum, item) => sum + SEVERITY_WEIGHT[item.severity], 0)
+  return conflicts
+    .filter((item) => item.stale !== '待重算')
+    .reduce((sum, item) => sum + SEVERITY_WEIGHT[item.severity], 0)
 }
 
 export function serializeReport(report: ContinuityReport): string {

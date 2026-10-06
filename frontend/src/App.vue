@@ -47,9 +47,12 @@ onMounted(() => {
         </el-menu-item>
       </el-menu>
       <div class="app-aside__foot">
-        <div>本地库 {{ dbName }} · v{{ schemaVersion }}</div>
-        <div>场次 {{ counts.scenes ?? 0 }} · 要素 {{ counts.elements ?? 0 }} · 拍摄日 {{ counts.shootDays ?? 0 }}</div>
+        <div>本地库 {{ dbName }} · v{{ schemaVersion }}（共同账）</div>
+        <div>场次 {{ counts.scenes ?? 0 }} · 共同账 {{ counts.ledgers ?? 0 }} · 要素 {{ counts.elements ?? 0 }}</div>
         <div>记录 {{ counts.records ?? 0 }} · 差异 {{ counts.conflicts ?? 0 }}</div>
+        <div v-if="(counts.drafts ?? 0) + (counts.quarantine ?? 0) > 0" class="app-aside__alert">
+          并发草稿 {{ counts.drafts ?? 0 }} · 隔离待确认 {{ counts.quarantine ?? 0 }}
+        </div>
       </div>
     </el-aside>
 
@@ -126,6 +129,14 @@ onMounted(() => {
   font-size: 11px;
   line-height: 1.8;
   color: rgba(233, 241, 246, 0.55);
+}
+
+.app-aside__alert {
+  margin-top: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(214, 137, 16, 0.22);
+  color: #f3c97e;
 }
 
 .app-header {
